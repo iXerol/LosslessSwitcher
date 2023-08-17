@@ -11,61 +11,79 @@ import SimplyCoreAudio
 
 class OutputDevices: ObservableObject {
     @Published var defaultOutputDevice: AudioDevice?
-    @Published var outputDevices = [AudioDevice]()
     @Published var currentSampleRate: Float64?
-    
+
     private let coreAudio = SimplyCoreAudio()
-    
-    private var changesCancellable: AnyCancellable?
-    private var defaultChangesCancellable: AnyCancellable?
-    
+
+    private var defaultChangesTask: Task<Void, Never>?
+
     private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
-    private var timerCancellable: AnyCancellable?
-    private var consoleQueue = DispatchQueue(label: "consoleQueue", qos: .userInteractive)
-    
+    private let outputUpdater = OutputUpdater()
+    private var timerTask: Task<Void, Never>?
+
     init() {
-        self.outputDevices = self.coreAudio.allOutputDevices
-        self.defaultOutputDevice = self.coreAudio.defaultOutputDevice
-        self.getDeviceSampleRate()
-        
-        changesCancellable =
-            NotificationCenter.default.publisher(for: .deviceListChanged).sink(receiveValue: { _ in
-                self.outputDevices = self.coreAudio.allOutputDevices
-            })
-        
-        defaultChangesCancellable =
-            NotificationCenter.default.publisher(for: .defaultOutputDeviceChanged).sink(receiveValue: { _ in
-                self.defaultOutputDevice = self.coreAudio.defaultOutputDevice
-                self.getDeviceSampleRate()
-            })
-        
-        timerCancellable = timer.sink(receiveValue: { _ in
-            self.consoleQueue.async {
-                self.switchLatestSampleRate()
+        defaultOutputDevice = coreAudio.defaultOutputDevice
+        updateDefaultDeviceSampleRate()
+
+        defaultChangesTask = Task { [weak self] in
+            for await _ in NotificationCenter.default.notifications(named: .defaultOutputDeviceChanged) {
+                guard let self,
+                      !Task.isCancelled else {
+                    return
+                }
+                await MainActor.run {
+                    self.defaultOutputDevice = self.coreAudio.defaultOutputDevice
+                }
+                self.updateDefaultDeviceSampleRate()
             }
-        })
+        }
+
+        timerTask = {
+            let timer = timer
+            let task = Task { [weak self] in
+                for await _ in timer.values {
+                    guard let self,
+                          !Task.isCancelled else {
+                        return
+                    }
+                    await outputUpdater.switchLatestSampleRate(self.defaultOutputDevice)
+                    let sampleRate = await self.outputUpdater.currentSampleRate
+                    await MainActor.run {
+                        self.currentSampleRate = sampleRate
+                    }
+                }
+            }
+            return task
+        }()
     }
-    
+
     deinit {
-        changesCancellable?.cancel()
-        defaultChangesCancellable?.cancel()
-        timerCancellable?.cancel()
+        defaultChangesTask?.cancel()
+        timerTask?.cancel()
         timer.upstream.connect().cancel()
     }
-    
-    func getDeviceSampleRate() {
-        let defaultDevice = self.defaultOutputDevice
+
+    func updateDefaultDeviceSampleRate() {
+        let defaultDevice = defaultOutputDevice
         guard let sampleRate = defaultDevice?.nominalSampleRate else { return }
-        self.updateSampleRate(sampleRate)
+        Task {
+            await outputUpdater.updateSampleRate(sampleRate)
+            self.currentSampleRate = await outputUpdater.currentSampleRate
+        }
     }
-    
-    func switchLatestSampleRate() {
+}
+
+fileprivate actor OutputUpdater {
+    var currentSampleRate: Float64?
+
+    func switchLatestSampleRate(_ device: AudioDevice?) async {
         do {
             let musicLog = try Console.getRecentEntries()
             let cmStats = CMPlayerParser.parseMusicConsoleLogs(musicLog)
-            
-            let defaultDevice = self.defaultOutputDevice
-            if let first = cmStats.first, let supported = defaultDevice?.nominalSampleRates {
+
+            let defaultDevice = device
+            if let first = cmStats.first,
+               let supported = defaultDevice?.nominalSampleRates {
                 let sampleRate = Float64(first.sampleRate)
                 // https://stackoverflow.com/a/65060134
                 let nearest = supported.enumerated().min(by: {
@@ -75,21 +93,20 @@ class OutputDevices: ObservableObject {
                     let nearestSampleRate = nearest.element
                     if nearestSampleRate != defaultDevice?.nominalSampleRate {
                         defaultDevice?.setNominalSampleRate(nearestSampleRate)
-                        self.updateSampleRate(nearestSampleRate)
+                        await updateSampleRate(nearestSampleRate)
                     }
                 }
             }
-        }
-        catch {
+        } catch {
             print(error)
         }
     }
-    
-    func updateSampleRate(_ sampleRate: Float64) {
-        DispatchQueue.main.async {
-            let readableSampleRate = sampleRate / 1000
-            self.currentSampleRate = readableSampleRate
-            
+
+    func updateSampleRate(_ sampleRate: Float64) async {
+        let readableSampleRate = sampleRate / 1000
+        currentSampleRate = readableSampleRate
+
+        await MainActor.run {
             let delegate = AppDelegate.instance
             delegate?.statusItemTitle = String(format: "%.1f kHz", readableSampleRate)
         }

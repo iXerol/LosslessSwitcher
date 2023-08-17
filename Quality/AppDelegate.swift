@@ -8,6 +8,7 @@
 import Cocoa
 import SwiftUI
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     
     // https://stackoverflow.com/a/66160164

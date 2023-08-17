@@ -25,7 +25,6 @@ class Defaults {
     }
     
     var statusBarItemTitle: String {
-        let title = self.userPreferIconStatusBarItem ? "Show Sample Rate" : "Show Icon"
-        return title
+        userPreferIconStatusBarItem ? "Show Sample Rate" : "Show Icon"
     }
 }
